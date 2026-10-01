@@ -1,0 +1,22 @@
+{
+  "format": 1,
+  "id": "actual-host-time",
+  "name": "WindowServer invalid actual_host_time guard",
+  "enabled": true,
+  "experimental": false,
+  "description": "Bypasses the SkyLight branch that enters the repeated Invalid actual_host_time logging path while leaving the following timestamp handling code intact.",
+  "target": {
+    "process": "WindowServer",
+    "module": "SkyLight",
+    "builds": ["22H730"],
+    "architectures": ["x86_64"]
+  },
+  "writes": [
+    {
+      "name": "bypass-invalid-actual-host-time-error-branch",
+      "offset": "0x185DB4",
+      "expected": "0f85a8010000",
+      "replacement": "909090909090"
+    }
+  ]
+}

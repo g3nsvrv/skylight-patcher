@@ -1,136 +1,144 @@
-# Ventura SkyLight / WindowServer CPU patch
+# Modular SkyLight / WindowServer runtime patcher
 
-Experimental runtime patch for a macOS WindowServer / SkyLight display-timing issue that can cause repeated errors such as:
+Experimental, build-specific runtime patches for macOS SkyLight / WindowServer problems.
 
-```text
-Invalid actual_host_time received from display: 0x... new time: ... last time: ...
-```
-
-On an affected Intel Mac, this message can be emitted several times per second. The suspected performance problem is not the log message by itself, but the fact that WindowServer repeatedly enters SkyLight's abnormal display-timing path, which calls `_SLSLogBreak` and the OS logging machinery over and over again.
-
-This project was created to bypass that repeated error path and, in turn, reduce the associated **WindowServer CPU usage**.
-
-On the tested system, applying the patch stopped the `Invalid actual_host_time received from display` flood immediately. The project is therefore intended for systems where high WindowServer CPU usage occurs together with this recurring SkyLight timing error.
-
-> [!IMPORTANT]
-> This should be described as a **display/frame timing problem**, not conclusively as a variable-refresh-rate bug. Similar reports are associated with frame presentation and refresh behavior, but the reverse-engineered Ventura code only proves that the failing path is validating display timing (`actual_host_time`).
+The repository is intentionally **modular**: the patch engine contains no hard-coded patch offsets. Every runtime modification lives in `patches/*.patch`, and the scripts only discover, validate, apply, verify, and reapply those definitions.
 
 > [!WARNING]
-> This is a build-specific machine-code patch for **macOS Ventura 13.7.8 (22H730), x86_64**. It is experimental and is not an Apple-supported fix. The patcher refuses to run on another macOS build and verifies the original instruction bytes before writing anything.
+> These are machine-code patches for **macOS Ventura 13.7.8, build 22H730, Intel/x86_64**. They are not Apple-supported fixes. The patcher refuses unknown builds/architectures and refuses to write if the bytes in memory are not exactly the expected original bytes (or the already-patched bytes).
 
-## Related report
-
-A matching error has been reported publicly in SDL issue [libsdl-org/SDL#11569](https://github.com/libsdl-org/SDL/issues/11569).
-
-The report reproduces the same `Invalid actual_host_time received from display` behavior on an Intel **MacBook Pro 13-inch 2020, Four Thunderbolt 3 ports**, while an Apple Silicon M2 MacBook Air did not reproduce it.
-
-That issue does not contain this patch. It is included as an independent public report of the same WindowServer / SkyLight behavior.
-
-## What the patch changes
-
-For Ventura 13.7.8 build `22H730`, the relevant SkyLight code contains the following instruction at Mach-O offset `0x185DB4`:
+## Repository layout
 
 ```text
-0F 85 A8 01 00 00    jne <SkyLight error path>
+.
+├── README.md
+├── install.sh
+├── run.sh
+├── uninstall.sh
+├── patches/
+│   ├── actual-host-time.patch
+│   └── stage-manager-cglayerkit-null-connection.patch
+└── scripts/
+    ├── lldb_patch.py
+    ├── local.skylight-patch.plist
+    ├── patcher.py
+    └── skylight-patch-monitor.sh
 ```
 
-The branch is reached from the display-present handler when SkyLight considers the new display timing invalid relative to the previous stored timing value.
+- `patches/*.patch`: declarative patch definitions. Adding a patch does not require changing the patch engine.
+- `scripts/patcher.py`: discovers patches, checks host compatibility, selects target processes and invokes LLDB.
+- `scripts/lldb_patch.py`: runs inside LLDB, verifies every byte range before changing memory, writes the plan, verifies the final bytes, then detaches.
+- `scripts/skylight-patch-monitor.sh`: watches for new target PIDs and reapplies applicable patches.
+- `scripts/local.skylight-patch.plist`: LaunchDaemon for automatic reapplication.
+- Root shell scripts are the public entry points.
 
-The patch replaces the conditional jump with six NOP instructions:
+## Included patches
+
+### `actual-host-time`
+
+File: `patches/actual-host-time.patch`
+
+Preserves the original patch for the repeated WindowServer/SkyLight message:
 
 ```text
-90 90 90 90 90 90
+Invalid actual_host_time received from display: ...
 ```
 
-In simplified form:
+For build `22H730`, it changes the branch at SkyLight module offset `0x185DB4`:
 
 ```text
-normal display-present handling
-        |
-        v
-compare actual_host_time
-        |
-        +---- timing considered invalid ----> _SLSLogBreak
-                                             os_log error
-                                             repeated CPU work
-
-                    becomes
-
-normal display-present handling
-        |
-        v
-compare actual_host_time
-        |
-        +---- continue through Apple's existing timestamp handling
+expected:    0f85a8010000    ; jne error path
+replacement: 909090909090    ; NOP x6
 ```
 
-The existing code immediately following the branch is left intact. The patch does not remove the entire timestamp handling routine; it only prevents execution from entering the repeated error/logging path.
+The following timestamp-handling code remains in place.
 
-## Why this may reduce WindowServer CPU usage
+### `stage-manager-cglayerkit-null-connection` (experimental)
 
-Before patching, the tested system produced roughly **5–6 `Invalid actual_host_time` errors per second** while WindowServer also showed unusually high CPU usage.
+File: `patches/stage-manager-cglayerkit-null-connection.patch`
 
-Reverse engineering showed that every occurrence could enter:
+This patch targets the WindowServer-side race observed with Stage Manager enabled:
 
 ```text
-_SLSLogBreak
-    -> logging checks
-    -> __os_log_error_impl
+WindowServer:  CGLayerKit called back with no connection
+WindowManager: CGSWindowShmemCreateWithPort failed on port 0
 ```
 
-The patch removes that repeated branch. After applying it, the same WindowServer log test showed **zero occurrences** of the error during the observed period.
+In the `22H730` SkyLight disassembly, `_CGLayerKitFetch` checks the connection early in the function, does more work, then reloads the connection from the same object immediately before a callback without testing it again:
 
-This project does **not** claim that all high WindowServer CPU usage is caused by this condition. It targets the specific case where high CPU usage coincides with the repeated `Invalid actual_host_time received from display` error.
+```asm
+; earlier
+cmpq    $0x0, 0x10(%r14)
+je      return
 
-## How it works
+; ... work ...
 
-The patch is applied only to the copy of SkyLight already loaded in **WindowServer's memory**.
+; immediately before callback
+movq    0x10(%r14), %rsi
+movq    %rbx, %rdi
+callq   <original callback>
+```
 
-It does **not** modify:
+That is consistent with the observed sequence where WindowManager's SkyLight connection is closed and a CGLayerKit callback arrives milliseconds later.
 
-- the sealed system volume
-- the dyld shared cache
-- the SkyLight binary on disk
+Instead of suppressing the log or disabling CGLayerKit, the patch inserts a final null check immediately before the original callback.
 
-Because it is an in-memory patch, it disappears when WindowServer restarts or the Mac reboots.
+Original call site, module offset `0x1079CC`:
 
-Two modes are provided:
+```text
+expected: e8dd7c2600
+```
 
-- `run.sh` — apply the patch manually to the currently running WindowServer
-- `install.sh` — install a LaunchDaemon that automatically reapplies it whenever WindowServer starts
+An existing 14-byte NOP area at module offset `0x107D9E` is used as a trampoline:
 
-Both modes use the same Python patch implementation under `scripts/`.
+```asm
+testq   %rsi, %rsi
+je      no_connection
+jmp     original_callback
 
-## Tested configuration
+no_connection:
+ret
+nop
+nop
+nop
+```
 
-- macOS Ventura 13.7.8
-- build `22H730`
-- Intel / x86_64
-- tested on MacBook Pro 13-inch 2020 (Four Thunderbolt 3 ports)
+Machine code:
 
-Other macOS builds are intentionally rejected because this patch relies on a specific machine-code offset and byte sequence.
+```text
+4885f67405e906792600c3909090
+```
+
+The call site is redirected to that trampoline:
+
+```text
+replacement: e8cd030000
+```
+
+If the connection is still valid, execution tail-jumps to the **same original callback**. If it has become null, the trampoline returns to `_CGLayerKitFetch` immediately after the original call site, allowing its existing cleanup path to continue.
+
+This patch does **not** blindly NOP the failing function and does **not** disable Stage Manager.
+
+> [!IMPORTANT]
+> This is currently an experimental fix for the WindowServer-side null-connection callback. It may also reduce the associated CPU load if that repeated callback/error path is the source of the load. It is not yet evidence that the separate WindowManager-side `CGSWindowShmemCreateWithPort failed on port 0` path is fixed. Patching that side safely requires locating and validating the corresponding code in the WindowManager binary rather than guessing an offset.
 
 ## Requirements
 
 ### LLDB
 
-Check that LLDB is available:
-
 ```bash
 xcrun -f lldb
 ```
 
-If it is missing, install the Xcode Command Line Tools:
+If missing:
 
 ```bash
 xcode-select --install
 ```
 
-### Allow LLDB to attach to WindowServer
+### Allow LLDB to attach to protected processes
 
-By default, SIP prevents LLDB from attaching to the protected WindowServer process.
-
-Boot into macOS Recovery, open Terminal, and disable only SIP's debugging restriction:
+From macOS Recovery:
 
 ```bash
 csrutil enable --without debug
@@ -138,145 +146,171 @@ csrutil enable --without debug
 
 Then reboot normally.
 
-You do **not** need to disable authenticated root for this runtime patch.
+Authenticated root does not need to be disabled because these patches only modify the in-memory copy loaded by the target process.
 
-## Quick install
+## List and validate patches
 
-Clone or download the repository, then run:
+Neither command writes process memory:
 
 ```bash
-chmod +x install.sh uninstall.sh run.sh
-sudo ./install.sh
-```
-
-That's it. The installer:
-
-1. verifies macOS build `22H730`
-2. verifies LLDB is available
-3. installs the patcher and monitor
-4. installs the LaunchDaemon
-5. starts automatic monitoring
-
-Installed files:
-
-```text
-/usr/local/share/skylight-patcher/skylight_patcher.py
-/usr/local/sbin/skylight-patch-monitor.sh
-/Library/LaunchDaemons/local.skylight-patch.plist
+python3 scripts/patcher.py --patch-dir patches --list
+python3 scripts/patcher.py --patch-dir patches --validate
 ```
 
 ## Manual use
 
-To apply the patch only to the currently running WindowServer:
+Apply every enabled compatible patch:
 
 ```bash
+chmod +x run.sh
 ./run.sh
 ```
 
-The script verifies all of the following before writing memory:
-
-- macOS build is exactly `22H730`
-- the selected module filename is exactly `SkyLight`
-- the instruction at `SkyLight __TEXT + 0x185DB4` is exactly `0f85a8010000`
-
-A successful run looks like:
-
-```text
-Current bytes : 0f85a8010000
-Expected      : 0f85a8010000
-New bytes     : 909090909090
-PATCH SUCCESSFUL
-WindowServer detached successfully
-```
-
-If any validation fails, the patcher refuses to modify memory.
-
-## Automatic mode
-
-After running:
+Apply only the Stage Manager patch:
 
 ```bash
+./run.sh --only stage-manager-cglayerkit-null-connection
+```
+
+Apply only the original refresh/timestamp patch:
+
+```bash
+./run.sh --only actual-host-time
+```
+
+`run.sh` requests `sudo` when necessary.
+
+A patch is applied only when all of these match:
+
+- macOS build
+- CPU architecture
+- target process
+- loaded module name
+- exact expected bytes for every write
+
+The LLDB helper validates the complete patch plan **before the first write**. It also accepts an already-patched byte sequence, making reapplication idempotent.
+
+For the Stage Manager patch, the trampoline is written first and only then is the original call redirected to it.
+
+## Install automatic reapplication
+
+Runtime patches disappear when their target process restarts or the Mac reboots. Install the LaunchDaemon to reapply them automatically:
+
+```bash
+chmod +x install.sh uninstall.sh
 sudo ./install.sh
 ```
 
-macOS launches `skylight-patch-monitor.sh` as a LaunchDaemon.
+Installed files:
 
-The monitor waits for WindowServer, applies the patch once to that PID, and then waits. If WindowServer restarts and receives a new PID, the patch is applied again automatically.
+```text
+/usr/local/share/skylight-patcher/scripts/patcher.py
+/usr/local/share/skylight-patcher/scripts/lldb_patch.py
+/usr/local/share/skylight-patcher/patches/*.patch
+/usr/local/sbin/skylight-patch-monitor.sh
+/Library/LaunchDaemons/local.skylight-patch.plist
+```
 
-### Check daemon status
+The monitor derives the process names it needs to watch from the patch definitions. A future `.patch` can therefore target another process (for example `WindowManager`) without hard-coding that process into the monitor.
+
+### Daemon status
 
 ```bash
 sudo launchctl print system/local.skylight-patch
 ```
 
-### Watch patch logs
+### Logs
 
 ```bash
 sudo tail -f /var/log/skylight-patch.log
 ```
 
-After a fresh boot, a successful application should look similar to:
+## Verify the Stage Manager patch
 
-```text
-Detected WindowServer PID 148
-Attempting SkyLight patch
-Current bytes : 0f85a8010000
-New bytes     : 909090909090
-PATCH SUCCESSFUL
-WindowServer detached successfully
-Patch verified for WindowServer PID 148
-```
-
-## Verify the fix
-
-Inspect WindowServer logs:
-
-```bash
-log show --last 5m --style compact --predicate 'process == "WindowServer"'
-```
-
-Or check only for the targeted error:
+Count WindowServer null-connection callbacks:
 
 ```bash
 log show --last 5m --style compact \
-  --predicate 'process == "WindowServer" AND eventMessage CONTAINS "Invalid actual_host_time received from display"'
+  --predicate 'process == "WindowServer" AND eventMessage CONTAINS "CGLayerKit called back with no connection"' \
+  | grep -c 'CGLayerKit called back with no connection'
 ```
 
-A successfully patched affected system should stop producing the repeated error.
-
-To measure the other half of the problem — WindowServer CPU usage — compare before and after:
+Count the paired WindowManager shared-memory error independently:
 
 ```bash
-top -pid "$(pgrep -x WindowServer)" -stats pid,cpu,time,threads,command
+log show --last 5m --style compact \
+  --predicate 'process == "WindowManager" AND eventMessage CONTAINS "CGSWindowShmemCreateWithPort failed on port 0"' \
+  | grep -c 'CGSWindowShmemCreateWithPort failed on port 0'
 ```
 
-## Uninstall
+Check CPU at the same time:
 
-Run:
+```bash
+ps -Ao pid,comm,%cpu | egrep 'WindowServer|WindowManager'
+```
+
+The useful A/B test is Stage Manager enabled before vs. after applying only `stage-manager-cglayerkit-null-connection` while leaving the workload otherwise unchanged.
+
+## Patch file format
+
+A `.patch` is JSON so the engine can validate it without executing patch-specific code:
+
+```json
+{
+  "format": 1,
+  "id": "example",
+  "name": "Example patch",
+  "enabled": true,
+  "experimental": true,
+  "target": {
+    "process": "WindowServer",
+    "module": "SkyLight",
+    "builds": ["22H730"],
+    "architectures": ["x86_64"]
+  },
+  "writes": [
+    {
+      "name": "example-write",
+      "offset": "0x1234",
+      "expected": "aabbccdd",
+      "replacement": "11223344"
+    }
+  ]
+}
+```
+
+All offsets are relative to the loaded module's Mach-O header address, so ASLR does not change the patch definition.
+
+## Disable a patch
+
+Set:
+
+```json
+"enabled": false
+```
+
+in that `.patch` file. No script changes are required.
+
+For a one-off test, prefer `--only` instead of editing files.
+
+## Uninstall
 
 ```bash
 sudo ./uninstall.sh
 ```
 
-This removes the LaunchDaemon and installed patch files.
+This removes the LaunchDaemon and installed patch files. A patch already present in the current process remains in RAM until that process restarts; reboot once to guarantee all runtime modifications are gone.
 
-The currently running WindowServer remains patched in RAM until it restarts. Reboot once after uninstalling to return SkyLight to its original machine code.
+## Safety properties
 
-If you no longer need debugger access, restore normal SIP from Recovery:
-
-```bash
-csrutil enable
-```
-
-## Safety checks
-
-The patcher is intentionally conservative:
-
-- supports build `22H730` only
-- matches the actual `SkyLight` module, not merely a path containing `SkyLight`
-- verifies the exact original machine-code bytes before writing
-- verifies the patched bytes after writing
-- attempts to detach WindowServer even when patching fails
-- modifies RAM only
-- does not patch the dyld cache or system volume
-- refuses to patch an updated or otherwise different SkyLight binary
+- build-specific and architecture-specific
+- target process and loaded module are explicit per patch
+- exact original-byte verification before writing
+- full patch plan validated before the first write
+- replacement bytes verified after writing
+- already-applied state recognized safely
+- overlapping writes rejected
+- target detached even on failure
+- no sealed-system-volume modification
+- no dyld shared-cache modification on disk
+- unsupported OS updates fail closed instead of receiving old offsets

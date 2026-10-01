@@ -1,22 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
-if [ "$(/usr/bin/id -u)" -ne 0 ]; then
-    echo "Run this uninstaller with sudo:" >&2
-    echo "  sudo ./uninstall.sh" >&2
-    exit 1
+BASE="/usr/local/share/skylight-patcher"
+MONITOR="/usr/local/sbin/skylight-patch-monitor.sh"
+PLIST="/Library/LaunchDaemons/local.skylight-patch.plist"
+LABEL="local.skylight-patch"
+
+if [[ ${EUID} -ne 0 ]]; then
+  exec sudo "$0" "$@"
 fi
 
-/bin/launchctl bootout system/local.skylight-patch >/dev/null 2>&1 || true
-/bin/rm -f /Library/LaunchDaemons/local.skylight-patch.plist
-/bin/rm -f /usr/local/sbin/skylight-patch-monitor.sh
-/bin/rm -f /usr/local/share/skylight-patcher/skylight_patcher.py
-/bin/rmdir /usr/local/share/skylight-patcher >/dev/null 2>&1 || true
-/bin/rm -f /var/log/skylight-patch.log
+/bin/launchctl bootout system/"$LABEL" >/dev/null 2>&1 || true
+rm -f "$PLIST" "$MONITOR"
+rm -rf "$BASE"
 
-cat <<'EOF'
-SkyLight patch daemon removed.
-
-The current WindowServer process remains patched in RAM until it restarts.
-Reboot macOS to return SkyLight to the original code immediately.
-EOF
+echo "Uninstalled. Runtime patches already present in the current WindowServer remain until WindowServer restarts or the Mac reboots."

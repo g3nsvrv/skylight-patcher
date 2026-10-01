@@ -1,26 +1,12 @@
-#!/bin/zsh
-set -u
+#!/bin/bash
+set -euo pipefail
 
-SCRIPT_DIR="${0:A:h}"
-PATCHER="$SCRIPT_DIR/scripts/skylight_patcher.py"
-LLDB="$(/usr/bin/xcrun -f lldb 2>/dev/null)" || {
-  echo "Error: LLDB not found. Install Xcode Command Line Tools." >&2
-  exit 1
-}
+ROOT="$(cd "$(dirname "$0")" && pwd)"
 
-[[ -f "$PATCHER" ]] || {
-  echo "Error: patcher not found: $PATCHER" >&2
-  exit 1
-}
+if [[ ${EUID} -ne 0 ]]; then
+  exec sudo /usr/bin/python3 "$ROOT/scripts/patcher.py" \
+    --patch-dir "$ROOT/patches" --once "$@"
+fi
 
-PID="$(/usr/bin/pgrep -x WindowServer | /usr/bin/head -n 1)"
-[[ -n "$PID" ]] || {
-  echo "Error: WindowServer is not running." >&2
-  exit 1
-}
-
-exec sudo "$LLDB" \
-  -b \
-  -p "$PID" \
-  -o "command script import $PATCHER" \
-  -o 'quit'
+exec /usr/bin/python3 "$ROOT/scripts/patcher.py" \
+  --patch-dir "$ROOT/patches" --once "$@"
