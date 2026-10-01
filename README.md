@@ -64,37 +64,42 @@ WindowServer:  CGLayerKit called back with no connection
 WindowManager: CGSWindowShmemCreateWithPort failed on port 0
 ```
 
-In the `22H730` SkyLight disassembly, `_CGLayerKitFetch` checks the connection early in the function, does more work, then reloads the connection from the same object immediately before a callback without testing it again:
+The first experimental revision guarded only the call inside `_CGLayerKitFetch` at module offset `0x1079CC`. Runtime testing showed that the error could still be reproduced with that call site patched. Re-checking the complete `22H730` disassembly shows that SkyLight invokes the **same helper** (`0x...3e46ae`) from exactly two call sites, and both reload a connection pointer immediately before the call without a local null check.
+
+Call site 1, module offset `0x08CAE5`:
 
 ```asm
-; earlier
-cmpq    $0x0, 0x10(%r14)
-je      return
-
-; ... work ...
-
-; immediately before callback
-movq    0x10(%r14), %rsi
-movq    %rbx, %rdi
-callq   <original callback>
+movq    0x10(%r13), %rsi
+movq    %r15, %rdi
+callq   <same CGLayerKit helper>
 ```
 
-That is consistent with the observed sequence where WindowManager's SkyLight connection is closed and a CGLayerKit callback arrives milliseconds later.
-
-Instead of suppressing the log or disabling CGLayerKit, the patch inserts a final null check immediately before the original callback.
-
-Original call site, module offset `0x1079CC`:
+Original call bytes:
 
 ```text
-expected: e8dd7c2600
+e8c42b2e00
 ```
 
-An existing 14-byte NOP area at module offset `0x107D9E` is used as a trampoline:
+Call site 2, inside `_CGLayerKitFetch`, module offset `0x1079CC`:
+
+```asm
+movq    0x10(%r14), %rsi
+movq    %rbx, %rdi
+callq   <same CGLayerKit helper>
+```
+
+Original call bytes:
+
+```text
+e8dd7c2600
+```
+
+An existing 14-byte NOP area at module offset `0x107D9E` is used as a shared trampoline:
 
 ```asm
 testq   %rsi, %rsi
 je      no_connection
-jmp     original_callback
+jmp     original_helper
 
 no_connection:
 ret
@@ -109,18 +114,19 @@ Machine code:
 4885f67405e906792600c3909090
 ```
 
-The call site is redirected to that trampoline:
+Both call sites are redirected to that trampoline:
 
 ```text
-replacement: e8cd030000
+0x08CAE5: e8c42b2e00 -> e8b4b20700
+0x1079CC: e8dd7c2600 -> e8cd030000
 ```
 
-If the connection is still valid, execution tail-jumps to the **same original callback**. If it has become null, the trampoline returns to `_CGLayerKitFetch` immediately after the original call site, allowing its existing cleanup path to continue.
+If the connection is still valid, the trampoline tail-jumps to the **same original helper**. If `%rsi` is null, it returns directly to the instruction following whichever original call site invoked it.
 
-This patch does **not** blindly NOP the failing function and does **not** disable Stage Manager.
+This patch does **not** NOP the helper, suppress the log function, or disable Stage Manager.
 
 > [!IMPORTANT]
-> This is currently an experimental fix for the WindowServer-side null-connection callback. It may also reduce the associated CPU load if that repeated callback/error path is the source of the load. It is not yet evidence that the separate WindowManager-side `CGSWindowShmemCreateWithPort failed on port 0` path is fixed. Patching that side safely requires locating and validating the corresponding code in the WindowManager binary rather than guessing an offset.
+> This remains experimental. The second call-site guard was added only after runtime testing proved that guarding `_CGLayerKitFetch` alone did not eliminate the error. The patcher validates the exact original or already-patched bytes at all three locations before writing. The separate WindowManager-side `CGSWindowShmemCreateWithPort failed on port 0` path is not patched here.
 
 ## Requirements
 
@@ -190,7 +196,7 @@ A patch is applied only when all of these match:
 
 The LLDB helper validates the complete patch plan **before the first write**. It also accepts an already-patched byte sequence, making reapplication idempotent.
 
-For the Stage Manager patch, the trampoline is written first and only then is the original call redirected to it.
+For the Stage Manager patch, the trampoline is written first and only then are both original call sites redirected to it.
 
 ## Install automatic reapplication
 

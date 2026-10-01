@@ -4,12 +4,16 @@
   "name": "Stage Manager CGLayerKit null-connection guard",
   "enabled": true,
   "experimental": true,
-  "description": "Adds a final null-connection guard immediately before the CGLayerKit callback reached by _CGLayerKitFetch. The original callback is preserved when the connection is valid; when it has disappeared, the trampoline returns without calling it.",
+  "description": "Adds a final null-connection guard before both SkyLight call sites that invoke the same CGLayerKit connection callback helper. The original helper is preserved when the connection is valid; when the connection has disappeared, the shared trampoline returns without calling it.",
   "target": {
     "process": "WindowServer",
     "module": "SkyLight",
-    "builds": ["22H730"],
-    "architectures": ["x86_64"]
+    "builds": [
+      "22H730"
+    ],
+    "architectures": [
+      "x86_64"
+    ]
   },
   "writes": [
     {
@@ -19,7 +23,13 @@
       "replacement": "4885f67405e906792600c3909090"
     },
     {
-      "name": "route-cglayerkit-callback-through-trampoline",
+      "name": "route-cglayerkit-window-update-callback-through-trampoline",
+      "offset": "0x08CAE5",
+      "expected": "e8c42b2e00",
+      "replacement": "e8b4b20700"
+    },
+    {
+      "name": "route-cglayerkit-fetch-callback-through-trampoline",
       "offset": "0x1079CC",
       "expected": "e8dd7c2600",
       "replacement": "e8cd030000"
