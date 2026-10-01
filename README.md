@@ -57,76 +57,96 @@ The following timestamp-handling code remains in place.
 
 File: `patches/stage-manager-cglayerkit-null-connection.patch`
 
-This patch targets the WindowServer-side race observed with Stage Manager enabled:
+This patch targets the WindowServer-side Stage Manager failure:
 
 ```text
-WindowServer:  CGLayerKit called back with no connection
-WindowManager: CGSWindowShmemCreateWithPort failed on port 0
+CGLayerKit called back with no connection
 ```
 
-The first experimental revision guarded only the call inside `_CGLayerKitFetch` at module offset `0x1079CC`. Runtime testing showed that the error could still be reproduced with that call site patched. Re-checking the complete `22H730` disassembly shows that SkyLight invokes the **same helper** (`0x...3e46ae`) from exactly two call sites, and both reload a connection pointer immediately before the call without a local null check.
+The current implementation is based on a runtime LLDB trace of the exact log
+emission, not on helper-call similarity.  On Ventura 13.7.8 build `22H730`, the
+captured backtrace was:
 
-Call site 1, module offset `0x08CAE5`:
+```text
+#00 libsystem_trace.dylib  _os_log_error_impl
+#01 SkyLight+0x3358CE      invocation function for block in
+                           layerkit_perform_on_main_thread(...)
+#02 SkyLight+0x44F9A       block_hoist_invoke_blocks(...)
+#03 SkyLight+0x44ECB       block_hoist_notification_handler(...)
+#04 SkyLight+0x31B07B      post_port_data
+#05 SkyLight+0x31ACFF      CGXRunOneServicesPass
+#06 SkyLight+0x31B74E      server_loop
+#07 SkyLight+0x31B5A7      SLXServer
+```
+
+The relevant code around the traced log is:
 
 ```asm
-movq    0x10(%r13), %rsi
-movq    %r15, %rdi
-callq   <same CGLayerKit helper>
+; no usable connection was found
+...
+callq   <os_log helper>          ; emits "CGLayerKit called back with no connection"
+jmp     null_callback
+
+null_callback:                   ; SkyLight + 0x33583F
+movq    0x20(%r14), %rdi
+xorl    %esi, %esi               ; connection argument = NULL
+
+callback_entry:                  ; SkyLight + 0x335845
+callq   *0x10(%rdi)
+
+cleanup:                         ; SkyLight + 0x335848
+...
 ```
 
-Original call bytes:
+A valid-connection path prepares `%rdi` and `%rsi` elsewhere and jumps directly
+to `callback_entry` at `+0x335845`.  Therefore the callback instruction itself
+must remain untouched.
+
+The patch changes only the six bytes at `SkyLight + 0x33583F`:
 
 ```text
-e8c42b2e00
+original:    498b7e2031f6
+             movq 0x20(%r14), %rdi
+             xorl %esi, %esi
+
+replacement: eb0790909090
+             jmp +7              ; -> SkyLight + 0x335848 cleanup
+             nop x4
 ```
 
-Call site 2, inside `_CGLayerKitFetch`, module offset `0x1079CC`:
+This means:
 
-```asm
-movq    0x10(%r14), %rsi
-movq    %rbx, %rdi
-callq   <same CGLayerKit helper>
-```
+- valid callbacks still enter at `+0x335845` and execute unchanged;
+- the confirmed no-connection path skips the NULL callback and continues at the
+  existing cleanup code;
+- the log itself is not NOPed or filtered;
+- Stage Manager and CGLayerKit are not disabled.
 
-Original call bytes:
+#### Automatic rollback of the earlier v2 experiment
+
+Two earlier experimental revisions redirected unrelated helper calls at
+`+0x08CAE5` and `+0x1079CC` through a trampoline at `+0x107D9E`. Runtime testing
+proved those changes did not intercept the traced error path.
+
+The current patch definition first restores those locations if the v2 bytes are
+present:
 
 ```text
-e8dd7c2600
+0x08CAE5: e8b4b20700 -> e8c42b2e00
+0x1079CC: e8cd030000 -> e8dd7c2600
+0x107D9E: 4885f67405e906792600c3909090
+          -> 9090909090909090909090909090
 ```
 
-An existing 14-byte NOP area at module offset `0x107D9E` is used as a shared trampoline:
-
-```asm
-testq   %rsi, %rsi
-je      no_connection
-jmp     original_helper
-
-no_connection:
-ret
-nop
-nop
-nop
-```
-
-Machine code:
-
-```text
-4885f67405e906792600c3909090
-```
-
-Both call sites are redirected to that trampoline:
-
-```text
-0x08CAE5: e8c42b2e00 -> e8b4b20700
-0x1079CC: e8dd7c2600 -> e8cd030000
-```
-
-If the connection is still valid, the trampoline tail-jumps to the **same original helper**. If `%rsi` is null, it returns directly to the instruction following whichever original call site invoked it.
-
-This patch does **not** NOP the helper, suppress the log function, or disable Stage Manager.
+On a fresh WindowServer the original bytes are already the desired replacement,
+so these rollback entries are simply reported as `already-patched`.  This keeps
+the same `.patch` usable both on a currently-v2-patched process and after a
+reboot.
 
 > [!IMPORTANT]
-> This remains experimental. The second call-site guard was added only after runtime testing proved that guarding `_CGLayerKitFetch` alone did not eliminate the error. The patcher validates the exact original or already-patched bytes at all three locations before writing. The separate WindowManager-side `CGSWindowShmemCreateWithPort failed on port 0` path is not patched here.
+> This patch remains experimental until CPU behavior and error frequency are
+> measured after applying the trace-verified guard. The separate WindowManager
+> message `CGSWindowShmemCreateWithPort failed on port 0` is not modified here.
 
 ## Requirements
 
