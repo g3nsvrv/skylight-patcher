@@ -1,10 +1,10 @@
 {
   "format": 1,
   "id": "stage-manager-cglayerkit-null-connection",
-  "name": "Stage Manager CGLayerKit null-connection callback guard",
+  "name": "Stage Manager CGLayerKit no-connection error-path guard",
   "enabled": true,
   "experimental": true,
-  "description": "Trace-verified fix for the WindowServer error 'CGLayerKit called back with no connection'. Runtime tracing places the log inside layerkit_perform_on_main_thread's block at SkyLight+0x3358CE. The no-connection path then deliberately prepares RSI=0 and invokes the client callback at +0x335845. This patch skips only that NULL callback preparation/dispatch path while leaving the valid callback entry at +0x335845 untouched. It also rolls back the disproven v2 helper-call guards if they are present.",
+  "description": "Trace- and string-verified fix for WindowServer's 'CGLayerKit called back with no connection' path on macOS 13.7.8 (22H730). Runtime tracing places the log at SkyLight+0x3358CE inside layerkit_perform_on_main_thread's block. Direct memory inspection identifies SkyLight+0x3DF740 as the exact 'called back with no connection' format string, distinguishing it from the separate 'not associated with this context' path at +0x3DF6F0. The no-connection path is entered exclusively at SkyLight+0x3357E8 after a NULL connection result. This patch redirects that entry directly to cleanup at +0x335848, before logging and before the NULL callback. It also rolls back the superseded v2 and v3 experiments when present.",
   "target": {
     "process": "WindowServer",
     "module": "SkyLight",
@@ -35,10 +35,16 @@
       "replacement": "9090909090909090909090909090"
     },
     {
-      "name": "skip-trace-verified-cglayerkit-null-callback",
+      "name": "rollback-v3-post-log-null-callback-skip",
       "offset": "0x33583F",
-      "expected": "498b7e2031f6",
-      "replacement": "eb0790909090"
+      "expected": "eb0790909090",
+      "replacement": "498b7e2031f6"
+    },
+    {
+      "name": "skip-trace-verified-cglayerkit-no-connection-error-path",
+      "offset": "0x3357E8",
+      "expected": "e8c5e6d2ff",
+      "replacement": "e95b000000"
     }
   ]
 }
